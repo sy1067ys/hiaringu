@@ -3,7 +3,20 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'node:path'
 
-import siteConfiguration from './.figma/make/site.json'
+// GitHubに .figma/make/site.json が存在しないため、サイト設定をここに直接書いています。
+// タイトルや説明文を変えたいときは、この中を編集してください。
+const siteConfiguration: FigmaSiteConfiguration = {
+  title: 'ヒアリンガ',
+  description:
+    'This app enables customers to input information and create items on a tablet, seamlessly syncing with a computer for efficient data sharing.',
+  language: 'ja',
+  robots: {
+    index: false,
+  },
+  accessibility: {
+    addBypassLinks: false,
+  },
+}
 
 // Vite config — https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
