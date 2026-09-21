@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, Component, type ReactNode } from "react";
 import WebsiteBriefForm, { WebsiteBrief, EMPTY_WEBSITE_BRIEF } from "./WebsiteBriefForm";
 import { BannerBriefForm, BannerBrief, EMPTY_BANNER_BRIEF, LogoBriefForm, LogoBrief, EMPTY_LOGO_BRIEF } from "./BannerLogoBriefForm";
 import AdBriefForm, { AdBrief, EMPTY_AD_BRIEF } from "./AdBriefForm";
@@ -9,6 +9,10 @@ import ContentBriefForm, { ContentBrief, EMPTY_CONTENT_BRIEF } from "./ContentBr
 import SnsBriefForm, { SnsBrief, EMPTY_SNS_BRIEF } from "./SnsBriefForm";
 import AppBriefForm, { AppBrief, EMPTY_APP_BRIEF } from "./AppBriefForm";
 import VideoBriefForm, { VideoBrief, EMPTY_VIDEO_BRIEF } from "./VideoBriefForm";
+import {
+  AuthError, detectBackend, submitRecord, flushOutbox, outboxCount, verifyPin,
+  listRecords as storeList, updateStatus as storeStatus, deleteRecord as storeDelete, importRecords as storeImport,
+} from "./storage";
 
 /* ─── Service Catalogue ─── */
 const SERVICE_CATEGORIES = [
@@ -105,7 +109,9 @@ const HOW_FOUND_OPTIONS = [
 ];
 
 const STEP_LABELS = ["お客様情報", "ご依頼内容", "ご予算・期間", "確認・送信"];
-const STORAGE_KEY = "yoichi_clients";
+const DRAFT_KEY = "yoichi_draft";
+const DRAFT_TTL_MS = 3 * 60 * 60 * 1000; // 入力途中のデータは3時間で自動的に無効
+const PIN_SESSION = "yoichi_admin_pin_session";
 
 type ServiceSelection = {
   categoryId: string;
@@ -165,26 +171,118 @@ const EMPTY_FORM: Omit<ClientRecord, "id" | "timestamp" | "status"> = {
   howFound: "", message: "", signature: "",
 };
 
-function loadRecords(): ClientRecord[] {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); }
-  catch { return []; }
+type Draft = { form: typeof EMPTY_FORM; step: number; savedAtMs: number };
+
+function loadDraft(): Draft | null {
+  try {
+    const raw = localStorage.getItem(DRAFT_KEY);
+    if (!raw) return null;
+    const d = JSON.parse(raw) as Draft;
+    if (!d || !d.form || Date.now() - d.savedAtMs > DRAFT_TTL_MS) {
+      localStorage.removeItem(DRAFT_KEY);
+      return null;
+    }
+    return { ...d, form: { ...EMPTY_FORM, ...d.form } };
+  } catch { return null; }
 }
-function saveRecords(r: ClientRecord[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(r));
+function clearDraft() {
+  try { localStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ }
 }
 
 export default function App() {
   const [mode, setMode] = useState<"tablet" | "pc">("tablet");
   const [step, setStep] = useState(0);
   const [form, setForm] = useState({ ...EMPTY_FORM });
-  const [records, setRecords] = useState<ClientRecord[]>(loadRecords);
+  const [records, setRecords] = useState<ClientRecord[]>([]);
   const [submitted, setSubmitted] = useState(false);
-  const [selectedRecord, setSelectedRecord] = useState<ClientRecord | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [queued, setQueued] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const [pending, setPending] = useState(0);
+  const [draft, setDraft] = useState<Draft | null>(loadDraft);
+  // null = 確認中 / true = サーバーに保存（全端末で同期） / false = この端末のみ
+  const [backend, setBackend] = useState<boolean | null>(null);
+  const [pin, setPin] = useState<string | null>(() => {
+    try { return sessionStorage.getItem(PIN_SESSION); } catch { return null; }
+  });
 
   useEffect(() => {
-    const iv = setInterval(() => setRecords(loadRecords()), 2000);
-    return () => clearInterval(iv);
+    let alive = true;
+    detectBackend().then((b) => { if (alive) setBackend(b); });
+    return () => { alive = false; };
   }, []);
+
+  // 通信できず端末に残った送信データを、回復したら自動で再送する
+  useEffect(() => {
+    if (backend !== true) return;
+    let stop = false;
+    const tick = async () => {
+      if (outboxCount() > 0) await flushOutbox();
+      if (!stop) setPending(outboxCount());
+    };
+    tick();
+    const iv = setInterval(tick, 15000);
+    return () => { stop = true; clearInterval(iv); };
+  }, [backend]);
+
+  // 入力途中の内容を自動で一時保存（タブレットの再読み込み・電池切れ対策）
+  useEffect(() => {
+    if (submitted) return;
+    const t = setTimeout(() => {
+      const pristine = JSON.stringify(form) === JSON.stringify(EMPTY_FORM);
+      if (pristine) return;
+      if (draft) setDraft(null); // 入力を始めたら、前回分の再開案内は消す
+      try {
+        localStorage.setItem(DRAFT_KEY, JSON.stringify({ form, step, savedAtMs: Date.now() }));
+      } catch { /* ignore */ }
+    }, 600);
+    return () => clearTimeout(t);
+  }, [form, step, submitted, draft]);
+
+  const lockAdmin = useCallback(() => {
+    setPin(null);
+    setRecords([]);
+    setSelectedId(null);
+    try { sessionStorage.removeItem(PIN_SESSION); } catch { /* ignore */ }
+  }, []);
+
+  const refresh = useCallback(async () => {
+    if (backend === null || (backend && !pin)) return;
+    try {
+      const list = await storeList<ClientRecord>(backend, pin ?? "");
+      setRecords(list);
+      setLoadError("");
+    } catch (e) {
+      if (e instanceof AuthError) lockAdmin();
+      else setLoadError(e instanceof Error ? e.message : "読み込みに失敗しました");
+    }
+  }, [backend, pin, lockAdmin]);
+
+  // 管理画面を開いている間、定期的に最新の受付を取得
+  useEffect(() => {
+    if (mode !== "pc") return;
+    refresh();
+    const iv = setInterval(refresh, backend ? 5000 : 2000);
+    return () => clearInterval(iv);
+  }, [mode, backend, refresh]);
+
+  function changeMode(m: "tablet" | "pc") {
+    if (m === "tablet") lockAdmin(); // ヒアリング画面に戻すときは管理画面をロック
+    setMode(m);
+  }
+
+  async function handlePinSubmit(p: string): Promise<string | null> {
+    try {
+      const ok = await verifyPin(p);
+      if (!ok) return "PINが違います";
+      setPin(p);
+      try { sessionStorage.setItem(PIN_SESSION, p); } catch { /* ignore */ }
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : "確認できませんでした";
+    }
+  }
 
   function setField<K extends keyof typeof EMPTY_FORM>(key: K, value: typeof EMPTY_FORM[K]) {
     setForm((f) => ({ ...f, [key]: value }));
@@ -299,28 +397,80 @@ export default function App() {
     }));
   }
 
-  function handleSubmit() {
+  async function handleSubmit() {
+    if (submitting) return;
+    setSubmitting(true);
     const record: ClientRecord = {
       ...form, id: Date.now().toString(),
       timestamp: new Date().toLocaleString("ja-JP"), status: "new",
     };
-    const updated = [record, ...records];
-    setRecords(updated);
-    saveRecords(updated);
-    setSubmitted(true);
+    try {
+      const be = backend ?? (await detectBackend());
+      const result = await submitRecord(record, be);
+      setQueued(result === "queued");
+      setPending(outboxCount());
+      clearDraft();
+      setDraft(null);
+      setSubmitted(true);
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : "送信できませんでした。もう一度お試しください。");
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   function handleReset() {
+    clearDraft();
+    setDraft(null);
     setForm({ ...EMPTY_FORM });
     setStep(0);
     setSubmitted(false);
+    setQueued(false);
   }
 
-  function updateStatus(id: string, status: ClientRecord["status"]) {
-    const updated = records.map((r) => r.id === id ? { ...r, status } : r);
-    setRecords(updated);
-    saveRecords(updated);
-    if (selectedRecord?.id === id) setSelectedRecord((r) => r ? { ...r, status } : r);
+  function handleRestoreDraft() {
+    if (!draft) return;
+    setForm(draft.form);
+    setStep(draft.step);
+    setDraft(null);
+  }
+
+  function handleDiscardDraft() {
+    clearDraft();
+    setDraft(null);
+  }
+
+  async function handleUpdateStatus(id: string, status: ClientRecord["status"]) {
+    if (backend === null) return;
+    setRecords((rs) => rs.map((r) => (r.id === id ? { ...r, status } : r)));
+    try {
+      await storeStatus(backend, pin ?? "", id, status);
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : "ステータスを更新できませんでした");
+      refresh();
+    }
+  }
+
+  async function handleDelete(id: string) {
+    if (backend === null) return;
+    try {
+      await storeDelete(backend, pin ?? "", id);
+      setRecords((rs) => rs.filter((r) => r.id !== id));
+      setSelectedId(null);
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : "削除できませんでした");
+    }
+  }
+
+  async function handleImport(recs: ClientRecord[]): Promise<string> {
+    if (backend === null) return "";
+    try {
+      const n = await storeImport(backend, pin ?? "", recs);
+      await refresh();
+      return `${n}件を追加しました（すでにあるデータは除きました）`;
+    } catch (e) {
+      return e instanceof Error ? e.message : "読み込みに失敗しました";
+    }
   }
 
   const canProceed = () => {
@@ -341,17 +491,25 @@ export default function App() {
           <div className="w-px h-6 bg-[#7c6455]" />
           <span className="text-[#c9b8a4] text-sm tracking-widest font-light">Client Hearing</span>
         </div>
-        <div className="flex gap-2">
-          {(["tablet", "pc"] as const).map((m) => (
-            <button key={m} onClick={() => setMode(m)}
-              className={`px-4 py-1.5 rounded text-sm font-medium transition-all ${
-                mode === m
-                  ? "bg-[#c9b8a4] text-[#1a1410]"
-                  : "text-[#c9b8a4] border border-[#3d2b1f] hover:border-[#7c6455]"
-              }`}>
-              {m === "tablet" ? "ヒアリング" : "PC管理画面"}
-            </button>
-          ))}
+        <div className="flex items-center gap-4">
+          <span className="text-xs tracking-wide flex items-center gap-1.5"
+            style={{ color: backend === null ? "#7c6455" : backend ? "#8fb69a" : "#d9b26f" }}>
+            <span className="inline-block w-2 h-2 rounded-full" style={{ background: "currentColor" }} />
+            {backend === null ? "接続確認中" : backend ? "同期オン" : "この端末のみ保存"}
+            {pending > 0 && <span className="ml-1 text-[#d4a5a5]">・未送信{pending}件</span>}
+          </span>
+          <div className="flex gap-2">
+            {(["tablet", "pc"] as const).map((m) => (
+              <button key={m} onClick={() => changeMode(m)}
+                className={`px-4 py-1.5 rounded text-sm font-medium transition-all ${
+                  mode === m
+                    ? "bg-[#c9b8a4] text-[#1a1410]"
+                    : "text-[#c9b8a4] border border-[#3d2b1f] hover:border-[#7c6455]"
+                }`}>
+                {m === "tablet" ? "ヒアリング" : "PC管理画面"}
+              </button>
+            ))}
+          </div>
         </div>
       </header>
 
@@ -379,17 +537,28 @@ export default function App() {
           onSubmit={handleSubmit}
           onReset={handleReset}
           canProceed={canProceed()}
+          submitting={submitting}
+          queued={queued}
+          draft={draft}
+          onRestoreDraft={handleRestoreDraft}
+          onDiscardDraft={handleDiscardDraft}
         />
+      ) : backend === null ? (
+        <div className="flex-1 flex items-center justify-center bg-[#f7f3ee] text-[#7c6455] text-sm">接続を確認しています…</div>
+      ) : backend && !pin ? (
+        <PinGate onSubmit={handlePinSubmit} />
       ) : (
-        <PCView records={records} selected={selectedRecord}
-          onSelect={setSelectedRecord} onUpdateStatus={updateStatus} />
+        <PCView records={records} selectedId={selectedId}
+          onSelect={setSelectedId} onUpdateStatus={handleUpdateStatus}
+          onDelete={handleDelete} onImport={handleImport}
+          backend={backend} error={loadError} />
       )}
     </div>
   );
 }
 
 /* ─── Tablet View ─── */
-function TabletView({ step, form, submitted, setField, onToggleCategory, onToggleItem, onSetDetail, onUpdateWebsiteBrief, onUpdateBannerBrief, onUpdateLogoBrief, onUpdateAdBrief, onUpdatePrBrief, onUpdateEcBrief, onUpdateProductBrief, onUpdateContentBrief, onUpdateSnsBrief, onUpdateAppBrief, onUpdateVideoBrief, onNext, onBack, onGoToStep, onSubmit, onReset, canProceed }: {
+function TabletView({ step, form, submitted, setField, onToggleCategory, onToggleItem, onSetDetail, onUpdateWebsiteBrief, onUpdateBannerBrief, onUpdateLogoBrief, onUpdateAdBrief, onUpdatePrBrief, onUpdateEcBrief, onUpdateProductBrief, onUpdateContentBrief, onUpdateSnsBrief, onUpdateAppBrief, onUpdateVideoBrief, onNext, onBack, onGoToStep, onSubmit, onReset, canProceed, submitting, queued, draft, onRestoreDraft, onDiscardDraft }: {
   step: number;
   form: typeof EMPTY_FORM;
   submitted: boolean;
@@ -414,6 +583,11 @@ function TabletView({ step, form, submitted, setField, onToggleCategory, onToggl
   onSubmit: () => void;
   onReset: () => void;
   canProceed: boolean;
+  submitting: boolean;
+  queued: boolean;
+  draft: Draft | null;
+  onRestoreDraft: () => void;
+  onDiscardDraft: () => void;
 }) {
   if (submitted) {
     return (
@@ -427,7 +601,12 @@ function TabletView({ step, form, submitted, setField, onToggleCategory, onToggl
           ありがとうございます
         </h2>
         <p className="text-[#7c6455] text-lg mb-1">ヒアリング内容を受け付けました</p>
-        <p className="text-[#c9b8a4] text-sm mb-10">担当者より改めてご連絡いたします</p>
+        <p className={`text-[#c9b8a4] text-sm ${queued ? "mb-6" : "mb-10"}`}>担当者より改めてご連絡いたします</p>
+        {queued && (
+          <p className="max-w-md text-sm text-[#8a6a3a] bg-[#f3e9d2] border border-[#d9b26f] rounded-lg px-4 py-3 mb-8">
+            通信できなかったため、このタブレットに一時保存しました。通信が回復すると自動で送信されます。アプリを開いたままお待ちください。
+          </p>
+        )}
         <button onClick={onReset}
           className="px-8 py-3 bg-[#1a1410] text-[#f7f3ee] rounded font-medium hover:bg-[#7c6455] transition-colors tracking-wide">
           新しいヒアリングへ
@@ -471,10 +650,26 @@ function TabletView({ step, form, submitted, setField, onToggleCategory, onToggl
 
       <div className="flex-1 overflow-y-auto px-6 py-8">
         <div className="max-w-3xl mx-auto">
+          {step === 0 && draft && (
+            <div className="mb-6 rounded-xl border border-[#d9b26f] bg-[#f3e9d2] px-5 py-4 flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold text-[#5c4033]">入力途中のデータが残っています</p>
+                <p className="text-xs text-[#8a6a3a] mt-0.5">
+                  保存：{new Date(draft.savedAtMs).toLocaleString("ja-JP")}　※前のお客様のデータの場合は「破棄」を選んでください
+                </p>
+              </div>
+              <div className="flex gap-2 flex-shrink-0">
+                <button type="button" onClick={onRestoreDraft}
+                  className="px-4 py-2 rounded bg-[#1a1410] text-[#f7f3ee] text-sm hover:bg-[#7c6455] transition-colors">続きから再開</button>
+                <button type="button" onClick={onDiscardDraft}
+                  className="px-4 py-2 rounded border border-[#7c6455] text-[#7c6455] text-sm hover:bg-white/50 transition-colors">破棄</button>
+              </div>
+            </div>
+          )}
           {step === 0 && <Step1 form={form} setField={setField} />}
           {step === 1 && <Step2 form={form} onToggleCategory={onToggleCategory} onToggleItem={onToggleItem} onSetDetail={onSetDetail} setField={setField} onUpdateWebsiteBrief={onUpdateWebsiteBrief} onUpdateBannerBrief={onUpdateBannerBrief} onUpdateLogoBrief={onUpdateLogoBrief} onUpdateAdBrief={onUpdateAdBrief} onUpdatePrBrief={onUpdatePrBrief} onUpdateEcBrief={onUpdateEcBrief} onUpdateProductBrief={onUpdateProductBrief} onUpdateContentBrief={onUpdateContentBrief} onUpdateSnsBrief={onUpdateSnsBrief} onUpdateAppBrief={onUpdateAppBrief} onUpdateVideoBrief={onUpdateVideoBrief} />}
           {step === 2 && <Step3 form={form} setField={setField} />}
-          {step === 3 && <Step4 form={form} setField={setField} onSubmit={onSubmit} onGoToStep={onGoToStep} />}
+          {step === 3 && <Step4 form={form} setField={setField} onSubmit={onSubmit} onGoToStep={onGoToStep} submitting={submitting} />}
         </div>
       </div>
 
@@ -906,11 +1101,12 @@ function ReviewSection({ title, onEdit, children }: { title: string; onEdit: () 
   );
 }
 
-function Step4({ form, setField, onSubmit, onGoToStep }: {
+function Step4({ form, setField, onSubmit, onGoToStep, submitting }: {
   form: typeof EMPTY_FORM;
   setField: <K extends keyof typeof EMPTY_FORM>(k: K, v: typeof EMPTY_FORM[K]) => void;
   onSubmit: () => void;
   onGoToStep: (s: number) => void;
+  submitting: boolean;
 }) {
   return (
     <div className="space-y-5">
@@ -1003,10 +1199,10 @@ function Step4({ form, setField, onSubmit, onGoToStep }: {
         <FInput value={form.signature} onChange={(v) => setField("signature", v)} placeholder="山田 太郎" />
       </div>
 
-      <button onClick={onSubmit} disabled={!form.signature}
+      <button onClick={onSubmit} disabled={!form.signature || submitting}
         style={{ fontFamily: "var(--font-display)" }}
         className="w-full py-4 bg-[#1a1410] text-[#f7f3ee] rounded-xl text-xl font-semibold italic disabled:opacity-40 hover:bg-[#7c6455] transition-colors tracking-wide">
-        送信する
+        {submitting ? "送信中…" : "送信する"}
       </button>
     </div>
   );
@@ -1029,37 +1225,262 @@ const STATUS_MAP = {
   done: { label: "完了", cls: "bg-[#8a9e8c]/30 text-[#2e4a30] border-[#8a9e8c]" },
 };
 
-function PCView({ records, selected, onSelect, onUpdateStatus }: {
-  records: ClientRecord[];
-  selected: ClientRecord | null;
-  onSelect: (r: ClientRecord) => void;
-  onUpdateStatus: (id: string, status: ClientRecord["status"]) => void;
+/* ─── PIN Gate ─── */
+function PinGate({ onSubmit }: { onSubmit: (pin: string) => Promise<string | null> }) {
+  const [pin, setPin] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function go() {
+    if (!pin || busy) return;
+    setBusy(true);
+    const msg = await onSubmit(pin);
+    setBusy(false);
+    if (msg) { setErr(msg); setPin(""); }
+  }
+
+  return (
+    <div className="flex-1 flex items-center justify-center bg-[#f7f3ee] p-8">
+      <div className="w-full max-w-sm bg-white border border-[#c9b8a4]/50 rounded-2xl p-8 shadow-sm text-center">
+        <h2 style={{ fontFamily: "var(--font-display)" }} className="text-2xl text-[#1a1410] italic mb-1">管理画面</h2>
+        <p className="text-sm text-[#7c6455] mb-6">スタッフ用のPINを入力してください</p>
+        <input
+          type="password" inputMode="numeric" autoComplete="off" autoFocus
+          value={pin}
+          onChange={(e) => { setPin(e.target.value); setErr(""); }}
+          onKeyDown={(e) => { if (e.key === "Enter") go(); }}
+          className="w-full text-center tracking-[0.4em] text-xl bg-white border border-[#c9b8a4]/60 rounded px-3 py-3 text-[#1a1410] focus:outline-none focus:border-[#7c6455] focus:ring-1 focus:ring-[#7c6455]/20"
+        />
+        {err && <p role="alert" className="text-sm text-[#a04040] mt-3">{err}</p>}
+        <button type="button" onClick={go} disabled={!pin || busy}
+          className="w-full mt-5 py-3 bg-[#1a1410] text-[#f7f3ee] rounded-lg font-medium disabled:opacity-40 hover:bg-[#7c6455] transition-colors">
+          {busy ? "確認中…" : "ひらく"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ─── 詳細ヒアリングの閲覧（入力内容をそのまま読み取り専用で表示） ─── */
+const noop = () => {};
+
+const BRIEF_VIEWS: { key: keyof ServiceSelection; label: string; empty: object; render: (b: any) => ReactNode }[] = [
+  { key: "websiteBrief", label: "Webサイト制作", empty: EMPTY_WEBSITE_BRIEF, render: (b) => <WebsiteBriefForm brief={b} onChange={noop} /> },
+  { key: "bannerBrief", label: "バナー広告", empty: EMPTY_BANNER_BRIEF, render: (b) => <BannerBriefForm brief={b} onChange={noop} /> },
+  { key: "logoBrief", label: "ロゴ・ブランディング", empty: EMPTY_LOGO_BRIEF, render: (b) => <LogoBriefForm brief={b} onChange={noop} /> },
+  { key: "snsBrief", label: "SNS運用", empty: EMPTY_SNS_BRIEF, render: (b) => <SnsBriefForm brief={b} onChange={noop} /> },
+  { key: "appBrief", label: "アプリ開発", empty: EMPTY_APP_BRIEF, render: (b) => <AppBriefForm brief={b} onChange={noop} /> },
+  { key: "adBrief", label: "Web広告運用", empty: EMPTY_AD_BRIEF, render: (b) => <AdBriefForm brief={b} onChange={noop} /> },
+  { key: "prBrief", label: "PR", empty: EMPTY_PR_BRIEF, render: (b) => <PrBriefForm brief={b} onChange={noop} /> },
+  { key: "videoBrief", label: "動画制作", empty: EMPTY_VIDEO_BRIEF, render: (b) => <VideoBriefForm brief={b} onChange={noop} /> },
+  { key: "contentBrief", label: "コンテンツ制作", empty: EMPTY_CONTENT_BRIEF, render: (b) => <ContentBriefForm brief={b} onChange={noop} /> },
+  { key: "ecBrief", label: "EC構築", empty: EMPTY_EC_BRIEF, render: (b) => <EcBriefForm brief={b} onChange={noop} /> },
+  { key: "productBrief", label: "商品企画", empty: EMPTY_PRODUCT_BRIEF, render: (b) => <ProductBriefForm brief={b} onChange={noop} /> },
+];
+
+function filledCount(b: Record<string, unknown>): number {
+  let n = 0;
+  for (const v of Object.values(b)) {
+    if (Array.isArray(v) ? v.length > 0 : typeof v === "string" ? v.trim() !== "" : !!v) n++;
+  }
+  return n;
+}
+
+class BriefBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() { return { failed: true }; }
+  render() {
+    return this.state.failed
+      ? <p className="p-4 text-sm text-[#7c3030]">この内容を画面に表示できませんでした。データ自体はバックアップ（JSON）に保存されています。</p>
+      : this.props.children;
+  }
+}
+
+function BriefMirror({ label, brief, empty, render }: {
+  label: string; brief: object; empty: object; render: (b: any) => ReactNode;
 }) {
+  const [open, setOpen] = useState(false);
+  const total = Object.keys(empty).length;
+  const filled = filledCount(brief as Record<string, unknown>);
+  return (
+    <div className="mt-3 border border-[#c9b8a4]/50 rounded-lg overflow-hidden">
+      <button type="button" onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center justify-between px-4 py-2.5 bg-[#f7f3ee] hover:bg-[#ede7de] text-left transition-colors">
+        <span className="text-sm font-semibold text-[#3d2b1f]">{label} 詳細ヒアリング</span>
+        <span className="text-xs text-[#7c6455]">入力 {filled} / {total} 項目　{open ? "▲ 閉じる" : "▼ ひらく"}</span>
+      </button>
+      {open && (
+        <div className="brief-readonly px-3 pb-4 bg-white">
+          <BriefBoundary>{render({ ...empty, ...brief })}</BriefBoundary>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── 書き出し（CSV／バックアップ） ─── */
+function csvCell(v: unknown): string {
+  let s = String(v ?? "");
+  if (/^[=+\-@]/.test(s)) s = "'" + s; // Excelの数式として実行されるのを防ぐ
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+function toCsv(records: ClientRecord[]): string {
+  const head = ["受付日時", "ステータス", "会社・屋号", "代表者名", "業種", "所在地", "依頼カテゴリ", "依頼項目", "ご予算", "納期", "きっかけ", "メッセージ"];
+  const rows = records.map((r) => {
+    const services = r.services ?? [];
+    return [
+      r.timestamp,
+      STATUS_MAP[r.status]?.label ?? r.status,
+      r.companyName,
+      r.representativeName,
+      r.industry,
+      [r.postalCode && `〒${r.postalCode}`, r.address].filter(Boolean).join(" "),
+      services.map((s) => SERVICE_CATEGORIES.find((c) => c.id === s.categoryId)?.label ?? s.categoryId).join(" / "),
+      services.flatMap((s) => s.items ?? []).join(" / "),
+      r.budget,
+      r.timeline,
+      r.howFound,
+      r.message,
+    ];
+  });
+  return "\uFEFF" + [head, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n");
+}
+
+function downloadFile(name: string, content: string, mime: string) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function todayStamp(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`;
+}
+
+function PCView({ records, selectedId, onSelect, onUpdateStatus, onDelete, onImport, backend, error }: {
+  records: ClientRecord[];
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+  onUpdateStatus: (id: string, status: ClientRecord["status"]) => void;
+  onDelete: (id: string) => void;
+  onImport: (records: ClientRecord[]) => Promise<string>;
+  backend: boolean;
+  error: string;
+}) {
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<"all" | ClientRecord["status"]>("all");
+  const [notice, setNotice] = useState("");
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return records.filter((r) => {
+      if (filter !== "all" && r.status !== filter) return false;
+      if (!q) return true;
+      return [r.companyName, r.representativeName, r.industry, r.address]
+        .some((v) => (v ?? "").toLowerCase().includes(q));
+    });
+  }, [records, query, filter]);
+
+  const selected = records.find((r) => r.id === selectedId) ?? null;
+  const count = (s: ClientRecord["status"]) => records.filter((r) => r.status === s).length;
+
+  async function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const parsed = JSON.parse(await file.text());
+      const list = Array.isArray(parsed) ? parsed : parsed?.records;
+      if (!Array.isArray(list)) throw new Error("format");
+      const valid = list.filter((r: any) => r && typeof r.id === "string" && typeof r.companyName === "string");
+      if (valid.length === 0) throw new Error("empty");
+      setNotice(await onImport(valid as ClientRecord[]));
+    } catch {
+      setNotice("読み込めませんでした。YOICHIのバックアップファイル（.json）を選んでください。");
+    }
+  }
+
+  function handleDelete() {
+    if (!selected) return;
+    if (window.confirm(`「${selected.companyName}」のデータを削除します。元に戻せません。よろしいですか？`)) {
+      onDelete(selected.id);
+    }
+  }
+
+  const btn = "px-2.5 py-1 text-xs rounded border border-[#3d2b1f] text-[#c9b8a4] hover:border-[#7c6455] hover:text-[#f7f3ee] transition-colors";
+
   return (
     <div className="flex-1 flex overflow-hidden">
+      <style>{`.brief-readonly input, .brief-readonly textarea, .brief-readonly select, .brief-readonly label { pointer-events: none; }`}</style>
+
       {/* Sidebar */}
       <div className="w-80 border-r border-[#c9b8a4]/40 bg-[#ede7de] flex flex-col">
         <div className="px-5 py-4 border-b border-[#c9b8a4]/40 bg-[#1a1410]">
           <h2 style={{ fontFamily: "var(--font-display)" }} className="text-lg text-[#f7f3ee] italic">受付リスト</h2>
-          <p className="text-xs text-[#7c6455] mt-0.5">{records.length}件 — 自動更新中</p>
+          <p className="text-xs text-[#7c6455] mt-0.5">
+            {filtered.length === records.length ? `${records.length}件` : `${filtered.length} / ${records.length}件`}
+            {" — "}{backend ? "自動で同期中" : "この端末のみ"}
+          </p>
+          <div className="flex gap-1.5 mt-3">
+            <button type="button" className={btn} disabled={records.length === 0}
+              onClick={() => downloadFile(`yoichi-hearing-${todayStamp()}.csv`, toCsv(filtered), "text/csv;charset=utf-8")}>
+              CSV
+            </button>
+            <button type="button" className={btn} disabled={records.length === 0}
+              onClick={() => downloadFile(`yoichi-backup-${todayStamp()}.json`, JSON.stringify({ exportedAt: new Date().toISOString(), records }, null, 2), "application/json")}>
+              バックアップ
+            </button>
+            <button type="button" className={btn} onClick={() => fileRef.current?.click()}>読み込み</button>
+            <input ref={fileRef} type="file" accept="application/json,.json" className="hidden" onChange={handleFile} />
+          </div>
+          {notice && <p className="text-xs text-[#c9b8a4] mt-2">{notice}</p>}
+          {error && <p role="alert" className="text-xs text-[#e0a0a0] mt-2">{error}</p>}
         </div>
+
+        <div className="px-4 py-3 border-b border-[#c9b8a4]/40 space-y-2">
+          <input type="search" value={query} onChange={(e) => setQuery(e.target.value)}
+            placeholder="会社名・代表者・業種で検索"
+            className="w-full bg-white border border-[#c9b8a4]/60 rounded px-3 py-2 text-sm text-[#1a1410] placeholder:text-[#c9b8a4] focus:outline-none focus:border-[#7c6455]" />
+          <div className="flex gap-1.5 flex-wrap">
+            {([["all", "すべて", records.length], ["new", "新規受付", count("new")], ["in-progress", "対応中", count("in-progress")], ["done", "完了", count("done")]] as const).map(([k, label, n]) => (
+              <button key={k} type="button" onClick={() => setFilter(k)}
+                className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
+                  filter === k ? "bg-[#1a1410] text-[#f7f3ee] border-[#1a1410]" : "bg-white text-[#7c6455] border-[#c9b8a4]/60 hover:border-[#7c6455]"
+                }`}>
+                {label} {n}
+              </button>
+            ))}
+          </div>
+        </div>
+
         <div className="flex-1 overflow-y-auto">
           {records.length === 0 ? (
             <div className="p-8 text-center text-[#c9b8a4] text-sm">まだデータがありません</div>
-          ) : records.map((r) => (
-            <button key={r.id} onClick={() => onSelect(r)}
-              className={`w-full text-left px-5 py-4 border-b border-[#c9b8a4]/30 hover:bg-[#c9b8a4]/20 transition-colors ${selected?.id === r.id ? "bg-[#c9b8a4]/30" : ""}`}>
+          ) : filtered.length === 0 ? (
+            <div className="p-8 text-center text-[#c9b8a4] text-sm">条件に合うデータがありません</div>
+          ) : filtered.map((r) => (
+            <button key={r.id} onClick={() => onSelect(r.id)}
+              className={`w-full text-left px-5 py-4 border-b border-[#c9b8a4]/30 hover:bg-[#c9b8a4]/20 transition-colors ${selectedId === r.id ? "bg-[#c9b8a4]/30" : ""}`}>
               <div className="flex items-center justify-between mb-1">
                 <span className="font-semibold text-[#1a1410] text-sm">{r.companyName}</span>
-                <span className={`text-xs px-2 py-0.5 rounded border ${STATUS_MAP[r.status].cls}`}>{STATUS_MAP[r.status].label}</span>
+                <span className={`text-xs px-2 py-0.5 rounded border ${STATUS_MAP[r.status]?.cls ?? ""}`}>{STATUS_MAP[r.status]?.label ?? r.status}</span>
               </div>
               <div className="text-xs text-[#7c6455]">{r.representativeName}{r.industry ? `・${r.industry}` : ""}</div>
               <div className="flex flex-wrap gap-1 mt-1.5">
-                {r.services.slice(0, 2).map((s) => {
+                {(r.services ?? []).slice(0, 2).map((s) => {
                   const cat = SERVICE_CATEGORIES.find((c) => c.id === s.categoryId);
                   return <span key={s.categoryId} className="text-xs px-1.5 py-0.5 bg-[#1a1410]/10 text-[#1a1410] rounded">{cat?.label}</span>;
                 })}
-                {r.services.length > 2 && <span className="text-xs text-[#7c6455]">+{r.services.length - 2}</span>}
+                {(r.services ?? []).length > 2 && <span className="text-xs text-[#7c6455]">+{r.services.length - 2}</span>}
               </div>
               <div className="text-xs text-[#c9b8a4] mt-1">{r.timestamp}</div>
             </button>
@@ -1070,13 +1491,13 @@ function PCView({ records, selected, onSelect, onUpdateStatus }: {
       {/* Detail */}
       {selected ? (
         <div className="flex-1 overflow-y-auto p-8 bg-[#f7f3ee]">
-          <div className="max-w-2xl mx-auto">
-            <div className="flex items-start justify-between mb-7">
+          <div className="max-w-3xl mx-auto">
+            <div className="flex items-start justify-between mb-7 gap-4">
               <div>
                 <h2 style={{ fontFamily: "var(--font-display)" }} className="text-3xl text-[#1a1410] italic">{selected.companyName}</h2>
                 <p className="text-[#7c6455] text-sm mt-1">{selected.representativeName} ／ {selected.timestamp}</p>
               </div>
-              <div className="flex gap-2">
+              <div className="flex gap-2 flex-wrap justify-end">
                 {(["new", "in-progress", "done"] as ClientRecord["status"][]).map((s) => (
                   <button key={s} onClick={() => onUpdateStatus(selected.id, s)}
                     className={`px-3 py-1.5 text-xs font-medium rounded border transition-all ${
@@ -1108,22 +1529,26 @@ function PCView({ records, selected, onSelect, onUpdateStatus }: {
 
               <DCard title="ご依頼内容">
                 <div className="space-y-5">
-                  {selected.services.map((s) => {
+                  {(selected.services ?? []).map((s) => {
                     const cat = SERVICE_CATEGORIES.find((c) => c.id === s.categoryId);
+                    const briefs = BRIEF_VIEWS.filter((v) => s[v.key]);
                     return (
                       <div key={s.categoryId} className="pb-4 border-b border-[#c9b8a4]/30 last:border-0 last:pb-0">
                         <div className="flex items-center gap-2 mb-2">
                           <span className="text-lg">{cat?.icon}</span>
                           <span className="font-semibold text-[#1a1410] text-sm">{cat?.label}</span>
                         </div>
-                        {s.items.length > 0 && (
+                        {(s.items ?? []).length > 0 && (
                           <div className="flex flex-wrap gap-1.5 mb-2">
                             {s.items.map((item) => (
                               <span key={item} className="text-xs px-2.5 py-1 bg-[#3d2b1f]/10 text-[#3d2b1f] rounded-full">{item}</span>
                             ))}
                           </div>
                         )}
-                        {s.detail && <p className="text-sm text-[#7c6455] mt-1">{s.detail}</p>}
+                        {s.detail && <p className="text-sm text-[#7c6455] mt-1 whitespace-pre-wrap">{s.detail}</p>}
+                        {briefs.map((v) => (
+                          <BriefMirror key={String(v.key)} label={v.label} brief={s[v.key] as object} empty={v.empty} render={v.render} />
+                        ))}
                       </div>
                     );
                   })}
@@ -1131,7 +1556,7 @@ function PCView({ records, selected, onSelect, onUpdateStatus }: {
                 {selected.projectOverview && (
                   <div className="mt-4 pt-4 border-t border-[#c9b8a4]/30">
                     <p className="text-xs text-[#7c6455] tracking-wider font-semibold uppercase mb-1">プロジェクト概要</p>
-                    <p className="text-[#1a1410] text-sm">{selected.projectOverview}</p>
+                    <p className="text-[#1a1410] text-sm whitespace-pre-wrap">{selected.projectOverview}</p>
                   </div>
                 )}
               </DCard>
@@ -1147,9 +1572,16 @@ function PCView({ records, selected, onSelect, onUpdateStatus }: {
 
               {selected.message && (
                 <DCard title="メッセージ">
-                  <p className="text-[#1a1410] text-sm">{selected.message}</p>
+                  <p className="text-[#1a1410] text-sm whitespace-pre-wrap">{selected.message}</p>
                 </DCard>
               )}
+
+              <div className="pt-4 text-right">
+                <button type="button" onClick={handleDelete}
+                  className="px-4 py-2 text-xs rounded border border-[#d4a5a5] text-[#a04040] hover:bg-[#d4a5a5]/20 transition-colors">
+                  このデータを削除
+                </button>
+              </div>
             </div>
           </div>
         </div>
